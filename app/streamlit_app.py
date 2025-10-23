@@ -37,6 +37,9 @@ def init_state():
 
 init_state()
 
+# --- DB init ---
+db.init_db()
+
 @st.cache_data(show_spinner=False)
 def _load_from_bytes(b: bytes) -> pd.DataFrame:
     return pd.read_csv(io.BytesIO(b))
@@ -45,8 +48,6 @@ def _load_from_bytes(b: bytes) -> pd.DataFrame:
 def _load_sample_csv() -> pd.DataFrame:
     return load_odds_csv(Path("data/sample_odds.csv"))
 
-# --- DB init ---
-db.init_db()
 
 # --- Sidebar: Bankroll & Settings ---
 st.sidebar.header("Settings")
@@ -67,8 +68,10 @@ def _on_upload_change():
     if f is None:
         return
     try:
-        st.session_state["odds_df"] = _load_from_bytes(f.getvalue())
-        st.session_state["odds_source"] = f"name: {getattr(f, 'name', 'uploaded.csv')}"
+        df = _load_from_bytes(f.getvalue())
+        st.session_state["odds_df"] = df
+        st.session_state["odds_bytes"] = df.to_csv(index=False).encode("utf-8")  # <-- snapshot
+        st.session_state["odds_source"] = f"upload:{getattr(f, 'name', 'uploaded.csv')}"  # <-- small label tweak
     except Exception as e:
         warn(f"Failed to load odds: {e}")
 
@@ -81,10 +84,32 @@ uploaded = st.sidebar.file_uploader(
 
 if st.sidebar.button("Load sample odds", key="btn_use_sample"):
     try:
-        st.session_state["odds_df"] = _load_sample_csv()
+        df = _load_sample_csv()
+        st.session_state["odds_df"] = df
+        st.session_state["odds_bytes"] = df.to_csv(index=False).encode("utf-8")  # <-- snapshot
         st.session_state["odds_source"] = "sample:data/sample_odds.csv"
     except Exception as e:
         warn(f"Failed to load sample: {e}")
+
+
+# --- Rehydrate odds on rerun if needed ---
+if st.session_state.get("odds_df") is None:
+    try:
+        # Best: rebuild from last snapshot
+        b = st.session_state.get("odds_bytes")
+        if b:
+            st.session_state["odds_df"] = pd.read_csv(io.BytesIO(b))
+        else:
+            # Fallback 1: file_uploader still has a file
+            f = st.session_state.get("odds_upload")
+            if f is not None:
+                st.session_state["odds_df"] = _load_from_bytes(f.getvalue())
+            # Fallback 2: sample previously selected
+            elif str(st.session_state.get("odds_source", "")).startswith("sample:"):
+                st.session_state["odds_df"] = _load_sample_csv()
+    except Exception as e:
+        warn(f"Rehydrate failed: {e}")
+
 
 st.title("Sports Betting MVP 💹")
 subtle("Edges, Kelly staking, arbitrage, and bet logging — minimal but extensible.")
@@ -94,9 +119,12 @@ with st.sidebar.expander("Debug: session"):
     st.write({
         "has_df": isinstance(odf, pd.DataFrame),
         "rows": (len(odf) if isinstance(odf, pd.DataFrame) else 0),
-        "source": st.session_state.get("odds_source")
+        "source": st.session_state.get("odds_source"),
+        "has_bytes": st.session_state.get("odds_bytes") is not None,   # <-- new
     })
-
+    if isinstance(odf, pd.DataFrame):
+        st.write({"df_id": id(odf), "shape": odf.shape})
+        st.dataframe(odf.head(5))
 
 # ---- Guard: require odds in session_state ----
 odf = st.session_state.get("odds_df")
@@ -147,9 +175,14 @@ if "selection" in odds_df.columns:
 if "market_type" in odds_df.columns:
     odds_df["market_type"] = odds_df["market_type"].astype(str).str.strip().str.upper()
 
-# Normalize labels for the model
+# Normalize labels BEFORE compute_edges so model sees expected tokens
 odds_df["selection"] = odds_df["selection"].astype(str).str.strip().str.upper()
 odds_df["market_type"] = odds_df["market_type"].astype(str).str.strip().str.upper()
+
+# Ensure decimal_odds exists/valid
+if "decimal_odds" not in odds_df.columns:
+    odds_df["decimal_odds"] = odds_df["american_odds"].map(american_to_decimal)
+odds_df["decimal_odds"] = pd.to_numeric(odds_df["decimal_odds"], errors="coerce")
 
 
 def compute_edges(df: pd.DataFrame) -> pd.DataFrame:
