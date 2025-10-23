@@ -1,0 +1,9 @@
+event_id,league,start_time,home_team,away_team,market_type,selection,book,american_odds,decimal_odds
+2025-10-21-NBA-LAL-GSW,NBA,2025-10-21T23:30:00Z,Lakers,Warriors,ML,HOME,Pinnacle,-110,
+2025-10-21-NBA-LAL-GSW,NBA,2025-10-21T23:30:00Z,Lakers,Warriors,ML,AWAY,Pinnacle,+100,
+2025-10-21-NBA-LAL-GSW,NBA,2025-10-21T23:30:00Z,Lakers,Warriors,ML,HOME,DK,-105,
+2025-10-21-NBA-LAL-GSW,NBA,2025-10-21T23:30:00Z,Lakers,Warriors,ML,AWAY,DK,-102,
+2025-10-21-NHL-TOR-MTL,NHL,2025-10-22T00:00:00Z,Maple Leafs,Canadiens,ML,HOME,MGM,-140,
+2025-10-21-NHL-TOR-MTL,NHL,2025-10-22T00:00:00Z,Maple Leafs,Canadiens,ML,AWAY,MGM,+125,
+2025-10-21-NHL-TOR-MTL,NHL,2025-10-22T00:00:00Z,Maple Leafs,Canadiens,ML,HOME,DK,-135,
+2025-10-21-NHL-TOR-MTL,NHL,2025-10-22T00:00:00Z,Maple Leafs,Canadiens,ML
