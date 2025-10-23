@@ -69,7 +69,6 @@ def _on_upload_change():
     try:
         st.session_state["odds_df"] = _load_from_bytes(f.getvalue())
         st.session_state["odds_source"] = f"name: {getattr(f, 'name', 'uploaded.csv')}"
-        st.session_state["use_sample"] = False
     except Exception as e:
         warn(f"Failed to load odds: {e}")
 
@@ -83,7 +82,6 @@ uploaded = st.sidebar.file_uploader(
 if st.sidebar.button("Load sample odds", key="btn_use_sample"):
     try:
         st.session_state["odds_df"] = _load_sample_csv()
-        st.session_state["use_sample"] = True
         st.session_state["odds_source"] = "sample:data/sample_odds.csv"
     except Exception as e:
         warn(f"Failed to load sample: {e}")
@@ -91,13 +89,23 @@ if st.sidebar.button("Load sample odds", key="btn_use_sample"):
 st.title("Sports Betting MVP 💹")
 subtle("Edges, Kelly staking, arbitrage, and bet logging — minimal but extensible.")
 
+with st.sidebar.expander("Debug: session"):
+    odf = st.session_state.get("odds_df", None)
+    st.write({
+        "has_df": isinstance(odf, pd.DataFrame),
+        "rows": (len(odf) if isinstance(odf, pd.DataFrame) else 0),
+        "source": st.session_state.get("odds_source")
+    })
+
+
 # ---- Guard: require odds in session_state ----
-if st.session_state["odds_df"] is None:
+odf = st.session_state.get("odds_df")
+if not isinstance(odf, pd.DataFrame) or odf.empty:
     st.info("Load some odds to begin (sidebar → upload or use sample).")
     st.stop()
 
-# From here on, always read from session_state
-odds_df = st.session_state["odds_df"].copy()
+# From here on, always work on a copy of session data
+odds_df = odf.copy()
 
 
 # --- Ensure required columns ---
@@ -138,6 +146,10 @@ if "selection" in odds_df.columns:
 
 if "market_type" in odds_df.columns:
     odds_df["market_type"] = odds_df["market_type"].astype(str).str.strip().str.upper()
+
+# Normalize labels for the model
+odds_df["selection"] = odds_df["selection"].astype(str).str.strip().str.upper()
+odds_df["market_type"] = odds_df["market_type"].astype(str).str.strip().str.upper()
 
 
 def compute_edges(df: pd.DataFrame) -> pd.DataFrame:
@@ -213,7 +225,7 @@ T1, T2, T3, T4 = st.tabs(["Today/Edges", "Arbitrage", "Bets & Bankroll", "Raw Od
 with T1:
     section("Edges by Market (¼-Kelly suggestions)")
 
-    # ---- (#3) Stable widget state ----
+ # ---- Stable widget state (inside with T1:) ----
     st.session_state.setdefault("ui_only_pos_ev", True)
     st.session_state.setdefault("ui_min_edge", 0.0)
 
@@ -229,6 +241,7 @@ with T1:
         value=bool(st.session_state["ui_only_pos_ev"]),
         key="only_pos_ev_chk",
     )
+
 
     # Apply filters using the stable state
     view = edges_df.copy()
