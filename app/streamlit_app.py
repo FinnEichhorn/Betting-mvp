@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 # --- PATH BOOTSTRAP: ensure repo root is on sys.path ---
 from pathlib import Path
 import sys
@@ -5,8 +7,6 @@ ROOT = Path(__file__).resolve().parents[1]  # repo root (parent of 'app')
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-
-from __future__ import annotations
 
 import io
 from datetime import datetime
