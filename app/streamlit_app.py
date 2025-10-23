@@ -135,6 +135,11 @@ if not isinstance(odf, pd.DataFrame) or odf.empty:
 # From here on, always work on a copy of session data
 odds_df = odf.copy()
 
+# ---- Pipeline debug: counts BEFORE any sanitization ----
+with st.expander("Debug: pipeline (pre-sanitize)"):
+    st.write({"odds_df_rows_pre": len(odds_df)})
+    st.dataframe(odds_df.head(10))
+
 
 # --- Ensure required columns ---
 required = ["event_id","league","start_time","home_team","away_team","market_type","selection","book","american_odds"]
@@ -158,6 +163,13 @@ if bad_mask.any():
     st.warning(f"Removed {int(bad_mask.sum())} row(s) with non-numeric american_odds.")
     odds_df = odds_df[~bad_mask]
 
+with st.expander("Debug: pipeline (after american_odds)"):
+    st.write({
+        "rows_after_american_odds": len(odds_df),
+        "removed_non_numeric_american_odds": int(bad_mask.sum()),
+    })
+
+
 # Now safe to cast to int
 odds_df["american_odds"] = odds_df["american_odds"].astype(int)
 
@@ -165,12 +177,25 @@ odds_df["american_odds"] = odds_df["american_odds"].astype(int)
 if "decimal_odds" not in odds_df.columns:
     odds_df["decimal_odds"] = odds_df["american_odds"].map(american_to_decimal)
 
+with st.expander("Debug: pipeline (after decimal_odds)"):
+    st.write({
+        "rows_after_decimal_odds_setup": len(odds_df),
+        "decimal_odds_null": int(odds_df["decimal_odds"].isna().sum()),
+        "decimal_odds_le_1": int((odds_df["decimal_odds"] <= 1).sum()),
+    })
+
 # Parse start_time for sorting
 odds_df["start_time"] = pd.to_datetime(odds_df["start_time"], errors="coerce")
 
 # Normalize selection and market_type early so models/EV behave
 if "selection" in odds_df.columns:
     odds_df["selection"] = odds_df["selection"].astype(str).str.strip().str.upper()
+
+with st.expander("Debug: pipeline (normalized + start_time)"):
+    st.write({
+        "rows_after_normalize": len(odds_df),
+        "start_time_null": int(odds_df["start_time"].isna().sum()),
+    })
 
 if "market_type" in odds_df.columns:
     odds_df["market_type"] = odds_df["market_type"].astype(str).str.strip().str.upper()
@@ -183,6 +208,13 @@ odds_df["market_type"] = odds_df["market_type"].astype(str).str.strip().str.uppe
 if "decimal_odds" not in odds_df.columns:
     odds_df["decimal_odds"] = odds_df["american_odds"].map(american_to_decimal)
 odds_df["decimal_odds"] = pd.to_numeric(odds_df["decimal_odds"], errors="coerce")
+
+def _kelly_fraction(decimal_odds: float, p: float) -> float:
+    # Kelly f* = (b*p - q)/b, where b = odds-1, q=1-p
+    b = float(decimal_odds) - 1.0
+    if b <= 0: 
+        return 0.0
+    return max(0.0, (b * p - (1.0 - p)) / b)
 
 
 def compute_edges(df: pd.DataFrame) -> pd.DataFrame:
@@ -200,36 +232,98 @@ def compute_edges(df: pd.DataFrame) -> pd.DataFrame:
             p1, p2 = remove_vig_two_way(float(g.iloc[0]["imp_raw"]), float(g.iloc[1]["imp_raw"]))
             df.loc[g.index, "prob_vigfree"] = [p1, p2]
 
-    # Baseline model probability (normalize inputs already uppercased)
+    # Baseline model probability
     df["model_prob"] = [
         baseline_probability(sel, h, a, mkt)
         for sel, h, a, mkt in zip(df["selection"], df["home_team"], df["away_team"], df["market_type"])
     ]
-
-    # Safety: coerce/clip to (0,1) to avoid NaNs/inf in EV
     df["model_prob"] = pd.to_numeric(df["model_prob"], errors="coerce").fillna(0.5)
     df["model_prob"] = df["model_prob"].clip(1e-6, 1 - 1e-6)
 
-    # Ensure decimal_odds valid
+    # Validate decimal_odds but do NOT drop rows
     df["decimal_odds"] = pd.to_numeric(df["decimal_odds"], errors="coerce")
-    bad_dec = (df["decimal_odds"].isna()) | (df["decimal_odds"] <= 1.0)
-    if bad_dec.any():
-        st.info(f"Dropped {int(bad_dec.sum())} row(s) with invalid decimal_odds.")
-        df = df[~bad_dec]
+    dec_ok = df["decimal_odds"].notna() & (df["decimal_odds"] > 1.0)
 
-    # EV & Kelly
-    evals = df.apply(lambda r: evaluate(r["decimal_odds"], r["model_prob"]), axis=1)
-    df["ev_per_$"] = [e.ev_per_dollar for e in evals]
-    df["kelly_25"] = [e.kelly_quarter for e in evals]
+    # ---- EV & Kelly (vectorized; no drops) ----
+    # Ensure numeric & valid ranges
+    df["decimal_odds"] = pd.to_numeric(df["decimal_odds"], errors="coerce")
+    df["model_prob"]   = pd.to_numeric(df["model_prob"],   errors="coerce").fillna(0.5).clip(1e-6, 1-1e-6)
+
+    dec_ok = df["decimal_odds"].notna() & (df["decimal_odds"] > 1.0)
+
+    # Initialize outputs
+    df["ev_per_$"] = np.nan
+    df["kelly_25"] = np.nan
+
+    # Compute where valid
+    if dec_ok.any():
+        o = df.loc[dec_ok, "decimal_odds"].astype(float)
+        p = df.loc[dec_ok, "model_prob"].astype(float)
+
+        ev = o * p - 1.0                                    # EV per $1
+        df.loc[dec_ok, "ev_per_$"] = ev
+
+        # Kelly (full) then quarter-kelly
+        # Vectorize the helper
+        k_full = ( (o - 1.0) * p - (1.0 - p) ) / (o - 1.0)
+        k_full = k_full.clip(lower=0.0)                     # don’t bet negative Kelly
+        df.loc[dec_ok, "kelly_25"] = k_full * 0.25
 
     # Convenience field for filtering
     df["edge_%"] = df["ev_per_$"] * 100.0
 
+    # Debug: show how many rows were invalid for EV math
+    with st.expander("Debug: EV/Kelly inputs"):
+        st.write({
+            "rows_total": len(df),
+            "dec_ok_rows": int(dec_ok.sum()),
+            "decimal_odds_null": int(df["decimal_odds"].isna().sum()),
+            "decimal_odds_le_1": int((df["decimal_odds"] <= 1).sum()),
+        })
+
+
+    # Convenience field for filtering
+    df["edge_%"] = df["ev_per_$"] * 100.0
+
+    # Debug info: how many rows lacked valid decimals
+    missing_dec = int((~dec_ok).sum())
+    if missing_dec:
+        with st.expander("Debug: compute_edges"):
+            st.write({"rows_missing_valid_decimal_odds": missing_dec})
+
     return df
 
+# --- Ensure american_odds is numeric and valid ---
+odds_df["american_odds"] = pd.to_numeric(odds_df["american_odds"], errors="coerce")
+bad_ao = odds_df["american_odds"].isna() | (odds_df["american_odds"] == 0)
+if bad_ao.any():
+    st.warning(f"Removed {int(bad_ao.sum())} row(s) with invalid american_odds (NaN or 0).")
+    odds_df = odds_df[~bad_ao]
+
+# --- Derive decimal_odds vectorized (ignore any previous mapping that returned None) ---
+ao = odds_df["american_odds"].astype(float)
+dec = np.where(ao > 0, 1.0 + ao/100.0, 1.0 + 100.0/ao.abs())
+odds_df["decimal_odds"] = dec
+
+# --- Normalize labels BEFORE compute_edges ---
+odds_df["selection"]   = odds_df["selection"].astype(str).str.strip().str.upper()
+odds_df["market_type"] = odds_df["market_type"].astype(str).str.strip().str.upper()
+
+# --- Quick debug to confirm decimals look good ---
+with st.expander("Debug: american → decimal"):
+    st.write({
+        "rows_now": len(odds_df),
+        "decimal_odds_null": int(odds_df["decimal_odds"].isna().sum()),
+        "decimal_odds_le_1": int((odds_df["decimal_odds"] <= 1).sum()),
+    })
+    st.write(odds_df[["american_odds", "decimal_odds"]].head(10))
 
 edges_df = compute_edges(odds_df)
 
+with st.expander("Debug: model & EV sample"):
+    st.write(edges_df[["selection","decimal_odds","model_prob","ev_per_$","kelly_25"]].head(10))
+    st.write("model_prob describe:", edges_df["model_prob"].describe())
+    st.write("decimal_odds describe:", edges_df["decimal_odds"].describe())
 
 # --- Best price per selection across books (robust to NaNs) ---
 # Normalize selection just in case
