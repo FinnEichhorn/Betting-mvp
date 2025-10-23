@@ -7,17 +7,13 @@ ROOT = Path(__file__).resolve().parents[1]  # repo root (parent of 'app')
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-
 import io
 from datetime import datetime
-from pathlib import Path
-
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
-
 
 from app.components.ui import section, subtle, warn, success
 from app.core.odds import american_to_implied_prob, american_to_decimal, remove_vig_two_way
@@ -27,54 +23,81 @@ from app.data.loader import load_odds_csv
 from app.models.baseline import baseline_probability
 import app.db as db
 
-
+# -------- helpers & session init --------
 load_dotenv()
-
-
 st.set_page_config(page_title="Betting MVP", page_icon="💹", layout="wide")
 
+def init_state():
+    st.session_state.setdefault("odds_df", None)
+    st.session_state.setdefault("use_sample", False)
+    st.session_state.setdefault("only_pos_ev", False)
+    st.session_state.setdefault("min_edge", 0.0)
+    # track last loaded source (nice for debugging / UI)
+    st.session_state.setdefault("odds_source", None)
+
+init_state()
+
+@st.cache_data(show_spinner=False)
+def _load_from_bytes(b: bytes) -> pd.DataFrame:
+    return pd.read_csv(io.BytesIO(b))
+
+@st.cache_data(show_spinner=False)
+def _load_sample_csv() -> pd.DataFrame:
+    return load_odds_csv(Path("data/sample_odds.csv"))
 
 # --- DB init ---
 db.init_db()
 
-
 # --- Sidebar: Bankroll & Settings ---
 st.sidebar.header("Settings")
 start_roll = st.sidebar.number_input(
-    "Starting bankroll ($)", min_value=0.0,
-    value=float(db.get_meta("starting_bankroll", "2000") or 2000.0), step=50.0
+    "Starting bankroll ($)",
+    min_value=0.0,
+    value=float(db.get_meta("starting_bankroll", "2000") or 2000.0),
+    step=50.0,
 )
-if st.sidebar.button("Save settings"):
+if st.sidebar.button("Save settings", key="save_settings"):
     db.set_meta("starting_bankroll", str(start_roll))
     db.record_snapshot()
     st.success("Settings saved.")
 
-# Sidebar controls (define before you use them)
-upload = st.sidebar.file_uploader("Upload CSV", type=["csv"])
-use_sample = st.sidebar.button("Load sample odds")
+# --- Sidebar: Odds loading controls ---
+def _on_upload_change():
+    f = st.session_state.get("odds_upload")
+    if f is None:
+        return
+    try:
+        st.session_state["odds_df"] = _load_from_bytes(f.getvalue())
+        st.session_state["odds_source"] = f"name: {getattr(f, 'name', 'uploaded.csv')}"
+        st.session_state["use_sample"] = False
+    except Exception as e:
+        warn(f"Failed to load odds: {e}")
 
+uploaded = st.sidebar.file_uploader(
+    "Upload CSV",
+    type=["csv"],
+    key="odds_upload",
+    on_change=_on_upload_change,
+)
 
-# Data load
-odds_df: pd.DataFrame | None = None
-
-try:
-    if upload is not None:
-        # Streamlit's uploader returns a file-like object; pd.read_csv can read it directly
-        odds_df = pd.read_csv(upload)
-    elif use_sample:
-        odds_df = load_odds_csv(Path("data/sample_odds.csv"))
-except Exception as e:
-    warn(f"Failed to load odds: {e}")
-
-
+if st.sidebar.button("Load sample odds", key="btn_use_sample"):
+    try:
+        st.session_state["odds_df"] = _load_sample_csv()
+        st.session_state["use_sample"] = True
+        st.session_state["odds_source"] = "sample:data/sample_odds.csv"
+    except Exception as e:
+        warn(f"Failed to load sample: {e}")
 
 st.title("Sports Betting MVP 💹")
 subtle("Edges, Kelly staking, arbitrage, and bet logging — minimal but extensible.")
 
-
-if odds_df is None:
+# ---- Guard: require odds in session_state ----
+if st.session_state["odds_df"] is None:
     st.info("Load some odds to begin (sidebar → upload or use sample).")
     st.stop()
+
+# From here on, always read from session_state
+odds_df = st.session_state["odds_df"].copy()
 
 
 # --- Ensure required columns ---
@@ -109,6 +132,14 @@ if "decimal_odds" not in odds_df.columns:
 # Parse start_time for sorting
 odds_df["start_time"] = pd.to_datetime(odds_df["start_time"], errors="coerce")
 
+# Normalize selection and market_type early so models/EV behave
+if "selection" in odds_df.columns:
+    odds_df["selection"] = odds_df["selection"].astype(str).str.strip().str.upper()
+
+if "market_type" in odds_df.columns:
+    odds_df["market_type"] = odds_df["market_type"].astype(str).str.strip().str.upper()
+
+
 def compute_edges(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
@@ -118,24 +149,32 @@ def compute_edges(df: pd.DataFrame) -> pd.DataFrame:
     # default: if we can't vig-strip, keep raw
     df["prob_vigfree"] = df["imp_raw"].values
 
-    # Pair rows by (event_id, market_type, book) and assign back by index
-    # Only do proper vig removal when the group has exactly two selections
+    # Two-way vig removal per (event, market, book)
     for (eid, mkt, book), g in df.groupby(["event_id", "market_type", "book"], dropna=False):
         if len(g) == 2:
-            # preserve row order within group for consistent assignment
             p1, p2 = remove_vig_two_way(float(g.iloc[0]["imp_raw"]), float(g.iloc[1]["imp_raw"]))
             df.loc[g.index, "prob_vigfree"] = [p1, p2]
-        # else: leave prob_vigfree as imp_raw (already set)
 
-    # Baseline model probability (replace with your real model later)
+    # Baseline model probability (normalize inputs already uppercased)
     df["model_prob"] = [
         baseline_probability(sel, h, a, mkt)
         for sel, h, a, mkt in zip(df["selection"], df["home_team"], df["away_team"], df["market_type"])
     ]
 
+    # Safety: coerce/clip to (0,1) to avoid NaNs/inf in EV
+    df["model_prob"] = pd.to_numeric(df["model_prob"], errors="coerce").fillna(0.5)
+    df["model_prob"] = df["model_prob"].clip(1e-6, 1 - 1e-6)
+
+    # Ensure decimal_odds valid
+    df["decimal_odds"] = pd.to_numeric(df["decimal_odds"], errors="coerce")
+    bad_dec = (df["decimal_odds"].isna()) | (df["decimal_odds"] <= 1.0)
+    if bad_dec.any():
+        st.info(f"Dropped {int(bad_dec.sum())} row(s) with invalid decimal_odds.")
+        df = df[~bad_dec]
+
     # EV & Kelly
     evals = df.apply(lambda r: evaluate(r["decimal_odds"], r["model_prob"]), axis=1)
-    df["ev_per_$"] = [e.ev_per_dollar for e in evals]   # uses the renamed field
+    df["ev_per_$"] = [e.ev_per_dollar for e in evals]
     df["kelly_25"] = [e.kelly_quarter for e in evals]
 
     # Convenience field for filtering
@@ -173,14 +212,42 @@ T1, T2, T3, T4 = st.tabs(["Today/Edges", "Arbitrage", "Bets & Bankroll", "Raw Od
 
 with T1:
     section("Edges by Market (¼-Kelly suggestions)")
-    min_edge = st.slider("Min edge (% per $1)", -10.0, 20.0, 0.0, 0.5)
-    show_only_pos = st.checkbox("Only positive EV", value=True)
 
+    # ---- (#3) Stable widget state ----
+    st.session_state.setdefault("ui_only_pos_ev", True)
+    st.session_state.setdefault("ui_min_edge", 0.0)
 
+    st.session_state["ui_min_edge"] = st.slider(
+        "Min edge (% per $1)",
+        -10.0, 20.0,
+        float(st.session_state["ui_min_edge"]),
+        0.5,
+        key="min_edge_sld",
+    )
+    st.session_state["ui_only_pos_ev"] = st.checkbox(
+        "Only positive EV",
+        value=bool(st.session_state["ui_only_pos_ev"]),
+        key="only_pos_ev_chk",
+    )
+
+    # Apply filters using the stable state
     view = edges_df.copy()
-    if show_only_pos:
+    if st.session_state["ui_only_pos_ev"]:
         view = view[view["ev_per_$"] > 0]
-    view = view[view["edge_%"] >= min_edge]
+    view = view[view["edge_%"] >= float(st.session_state["ui_min_edge"])]
+
+    # ---- (#4) Empty-table explanation (debug) ----
+    if view.empty:
+        with st.expander("Why is this empty? (debug)"):
+            st.write({
+                "rows_loaded": len(edges_df),
+                "positive_ev_rows": int((edges_df["ev_per_$"] > 0).sum()),
+                "min_edge_filter": float(st.session_state["ui_min_edge"]),
+                "only_pos_ev": bool(st.session_state["ui_only_pos_ev"]),
+            })
+            st.write("Model prob summary:", edges_df["model_prob"].describe())
+            st.write("EV per $ summary:", edges_df["ev_per_$"].describe())
+
 
 
     cols = [
