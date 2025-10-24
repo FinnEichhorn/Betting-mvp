@@ -1,523 +1,661 @@
 from __future__ import annotations
 
-# --- PATH BOOTSTRAP: ensure repo root is on sys.path ---
+# ── sys.path bootstrap so "app/..." imports work both locally and in deployment ──
 from pathlib import Path
 import sys
-ROOT = Path(__file__).resolve().parents[1]  # repo root (parent of 'app')
+
+ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import io
-from datetime import datetime
-
+# ── standard / third-party ──
 import numpy as np
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
+import os
+import requests
 
-from app.components.ui import section, subtle, warn, success
-from app.core.odds import american_to_implied_prob, american_to_decimal, remove_vig_two_way
+# ── project imports (adjust provider path if yours differs) ──
+from app.models.baseline import BaselineModel, BaselineConfig
+from app.core.odds import american_to_implied_prob, american_to_decimal
 from app.core.ev import evaluate
-from app.core.arb import is_two_way_arb, arb_stakes
-from app.data.loader import load_odds_csv
-from app.models.baseline import baseline_probability
-import app.db as db
-
-# -------- helpers & session init --------
-load_dotenv()
-st.set_page_config(page_title="Betting MVP", page_icon="💹", layout="wide")
-
-def init_state():
-    st.session_state.setdefault("odds_df", None)
-    st.session_state.setdefault("use_sample", False)
-    st.session_state.setdefault("only_pos_ev", False)
-    st.session_state.setdefault("min_edge", 0.0)
-    # track last loaded source (nice for debugging / UI)
-    st.session_state.setdefault("odds_source", None)
-
-init_state()
-
-# --- DB init ---
-db.init_db()
-
-@st.cache_data(show_spinner=False)
-def _load_from_bytes(b: bytes) -> pd.DataFrame:
-    return pd.read_csv(io.BytesIO(b))
-
-@st.cache_data(show_spinner=False)
-def _load_sample_csv() -> pd.DataFrame:
-    return load_odds_csv(Path("data/sample_odds.csv"))
-
-
-# --- Sidebar: Bankroll & Settings ---
-st.sidebar.header("Settings")
-start_roll = st.sidebar.number_input(
-    "Starting bankroll ($)",
-    min_value=0.0,
-    value=float(db.get_meta("starting_bankroll", "2000") or 2000.0),
-    step=50.0,
-)
-if st.sidebar.button("Save settings", key="save_settings"):
-    db.set_meta("starting_bankroll", str(start_roll))
-    db.record_snapshot()
-    st.success("Settings saved.")
-
-# --- Sidebar: Odds loading controls ---
-def _on_upload_change():
-    f = st.session_state.get("odds_upload")
-    if f is None:
-        return
-    try:
-        df = _load_from_bytes(f.getvalue())
-        st.session_state["odds_df"] = df
-        st.session_state["odds_bytes"] = df.to_csv(index=False).encode("utf-8")  # <-- snapshot
-        st.session_state["odds_source"] = f"upload:{getattr(f, 'name', 'uploaded.csv')}"  # <-- small label tweak
-    except Exception as e:
-        warn(f"Failed to load odds: {e}")
-
-uploaded = st.sidebar.file_uploader(
-    "Upload CSV",
-    type=["csv"],
-    key="odds_upload",
-    on_change=_on_upload_change,
-)
-
-if st.sidebar.button("Load sample odds", key="btn_use_sample"):
-    try:
-        df = _load_sample_csv()
-        st.session_state["odds_df"] = df
-        st.session_state["odds_bytes"] = df.to_csv(index=False).encode("utf-8")  # <-- snapshot
-        st.session_state["odds_source"] = "sample:data/sample_odds.csv"
-    except Exception as e:
-        warn(f"Failed to load sample: {e}")
-
-
-# --- Rehydrate odds on rerun if needed ---
-if st.session_state.get("odds_df") is None:
-    try:
-        # Best: rebuild from last snapshot
-        b = st.session_state.get("odds_bytes")
-        if b:
-            st.session_state["odds_df"] = pd.read_csv(io.BytesIO(b))
-        else:
-            # Fallback 1: file_uploader still has a file
-            f = st.session_state.get("odds_upload")
-            if f is not None:
-                st.session_state["odds_df"] = _load_from_bytes(f.getvalue())
-            # Fallback 2: sample previously selected
-            elif str(st.session_state.get("odds_source", "")).startswith("sample:"):
-                st.session_state["odds_df"] = _load_sample_csv()
-    except Exception as e:
-        warn(f"Rehydrate failed: {e}")
-
-
-st.title("Sports Betting MVP 💹")
-subtle("Edges, Kelly staking, arbitrage, and bet logging — minimal but extensible.")
-
-with st.sidebar.expander("Debug: session"):
-    odf = st.session_state.get("odds_df", None)
-    st.write({
-        "has_df": isinstance(odf, pd.DataFrame),
-        "rows": (len(odf) if isinstance(odf, pd.DataFrame) else 0),
-        "source": st.session_state.get("odds_source"),
-        "has_bytes": st.session_state.get("odds_bytes") is not None,   # <-- new
-    })
-    if isinstance(odf, pd.DataFrame):
-        st.write({"df_id": id(odf), "shape": odf.shape})
-        st.dataframe(odf.head(5))
-
-# ---- Guard: require odds in session_state ----
-odf = st.session_state.get("odds_df")
-if not isinstance(odf, pd.DataFrame) or odf.empty:
-    st.info("Load some odds to begin (sidebar → upload or use sample).")
-    st.stop()
-
-# From here on, always work on a copy of session data
-odds_df = odf.copy()
-
-# ---- Pipeline debug: counts BEFORE any sanitization ----
-with st.expander("Debug: pipeline (pre-sanitize)"):
-    st.write({"odds_df_rows_pre": len(odds_df)})
-    st.dataframe(odds_df.head(10))
-
-
-# --- Ensure required columns ---
-required = ["event_id","league","start_time","home_team","away_team","market_type","selection","book","american_odds"]
-missing = [c for c in required if c not in odds_df.columns]
-if missing:
-    warn(f"Missing required columns: {missing}")
-    st.stop()
-
-# --- Sanitize inputs ---
-odds_df = odds_df.copy()
-
-# Strip whitespace from text columns (helps with weird CSVs)
-for col in ["event_id","league","home_team","away_team","market_type","selection","book"]:
-    if col in odds_df.columns:
-        odds_df[col] = odds_df[col].astype(str).str.strip()
-
-# Parse odds to numeric, drop bad rows with a clear message
-odds_df["american_odds"] = pd.to_numeric(odds_df["american_odds"], errors="coerce")
-bad_mask = odds_df["american_odds"].isna()
-if bad_mask.any():
-    st.warning(f"Removed {int(bad_mask.sum())} row(s) with non-numeric american_odds.")
-    odds_df = odds_df[~bad_mask]
-
-with st.expander("Debug: pipeline (after american_odds)"):
-    st.write({
-        "rows_after_american_odds": len(odds_df),
-        "removed_non_numeric_american_odds": int(bad_mask.sum()),
-    })
-
-
-# Now safe to cast to int
-odds_df["american_odds"] = odds_df["american_odds"].astype(int)
-
-# Derive decimal_odds if absent
-if "decimal_odds" not in odds_df.columns:
-    odds_df["decimal_odds"] = odds_df["american_odds"].map(american_to_decimal)
-
-with st.expander("Debug: pipeline (after decimal_odds)"):
-    st.write({
-        "rows_after_decimal_odds_setup": len(odds_df),
-        "decimal_odds_null": int(odds_df["decimal_odds"].isna().sum()),
-        "decimal_odds_le_1": int((odds_df["decimal_odds"] <= 1).sum()),
-    })
-
-# Parse start_time for sorting
-odds_df["start_time"] = pd.to_datetime(odds_df["start_time"], errors="coerce")
-
-# Normalize selection and market_type early so models/EV behave
-if "selection" in odds_df.columns:
-    odds_df["selection"] = odds_df["selection"].astype(str).str.strip().str.upper()
-
-with st.expander("Debug: pipeline (normalized + start_time)"):
-    st.write({
-        "rows_after_normalize": len(odds_df),
-        "start_time_null": int(odds_df["start_time"].isna().sum()),
-    })
-
-if "market_type" in odds_df.columns:
-    odds_df["market_type"] = odds_df["market_type"].astype(str).str.strip().str.upper()
-
-# Normalize labels BEFORE compute_edges so model sees expected tokens
-odds_df["selection"] = odds_df["selection"].astype(str).str.strip().str.upper()
-odds_df["market_type"] = odds_df["market_type"].astype(str).str.strip().str.upper()
-
-# Ensure decimal_odds exists/valid
-if "decimal_odds" not in odds_df.columns:
-    odds_df["decimal_odds"] = odds_df["american_odds"].map(american_to_decimal)
-odds_df["decimal_odds"] = pd.to_numeric(odds_df["decimal_odds"], errors="coerce")
-
-def _kelly_fraction(decimal_odds: float, p: float) -> float:
-    # Kelly f* = (b*p - q)/b, where b = odds-1, q=1-p
-    b = float(decimal_odds) - 1.0
-    if b <= 0: 
-        return 0.0
-    return max(0.0, (b * p - (1.0 - p)) / b)
-
-
-def compute_edges(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-
-    # raw implied prob from american odds
-    df["imp_raw"] = df["american_odds"].astype(int).map(american_to_implied_prob)
-
-    # default: if we can't vig-strip, keep raw
-    df["prob_vigfree"] = df["imp_raw"].values
-
-    # Two-way vig removal per (event, market, book)
-    for (eid, mkt, book), g in df.groupby(["event_id", "market_type", "book"], dropna=False):
-        if len(g) == 2:
-            p1, p2 = remove_vig_two_way(float(g.iloc[0]["imp_raw"]), float(g.iloc[1]["imp_raw"]))
-            df.loc[g.index, "prob_vigfree"] = [p1, p2]
-
-    # Baseline model probability
-    df["model_prob"] = [
-        baseline_probability(sel, h, a, mkt)
-        for sel, h, a, mkt in zip(df["selection"], df["home_team"], df["away_team"], df["market_type"])
-    ]
-    df["model_prob"] = pd.to_numeric(df["model_prob"], errors="coerce").fillna(0.5)
-    df["model_prob"] = df["model_prob"].clip(1e-6, 1 - 1e-6)
-
-    # Validate decimal_odds but do NOT drop rows
-    df["decimal_odds"] = pd.to_numeric(df["decimal_odds"], errors="coerce")
-    dec_ok = df["decimal_odds"].notna() & (df["decimal_odds"] > 1.0)
-
-    # ---- EV & Kelly (vectorized; no drops) ----
-    # Ensure numeric & valid ranges
-    df["decimal_odds"] = pd.to_numeric(df["decimal_odds"], errors="coerce")
-    df["model_prob"]   = pd.to_numeric(df["model_prob"],   errors="coerce").fillna(0.5).clip(1e-6, 1-1e-6)
-
-    dec_ok = df["decimal_odds"].notna() & (df["decimal_odds"] > 1.0)
-
-    # Initialize outputs
-    df["ev_per_$"] = np.nan
-    df["kelly_25"] = np.nan
-
-    # Compute where valid
-    if dec_ok.any():
-        o = df.loc[dec_ok, "decimal_odds"].astype(float)
-        p = df.loc[dec_ok, "model_prob"].astype(float)
-
-        ev = o * p - 1.0                                    # EV per $1
-        df.loc[dec_ok, "ev_per_$"] = ev
-
-        # Kelly (full) then quarter-kelly
-        # Vectorize the helper
-        k_full = ( (o - 1.0) * p - (1.0 - p) ) / (o - 1.0)
-        k_full = k_full.clip(lower=0.0)                     # don’t bet negative Kelly
-        df.loc[dec_ok, "kelly_25"] = k_full * 0.25
-
-    # Convenience field for filtering
-    df["edge_%"] = df["ev_per_$"] * 100.0
-
-    # Debug: show how many rows were invalid for EV math
-    with st.expander("Debug: EV/Kelly inputs"):
-        st.write({
-            "rows_total": len(df),
-            "dec_ok_rows": int(dec_ok.sum()),
-            "decimal_odds_null": int(df["decimal_odds"].isna().sum()),
-            "decimal_odds_le_1": int((df["decimal_odds"] <= 1).sum()),
-        })
-
-
-    # Convenience field for filtering
-    df["edge_%"] = df["ev_per_$"] * 100.0
-
-    # Debug info: how many rows lacked valid decimals
-    missing_dec = int((~dec_ok).sum())
-    if missing_dec:
-        with st.expander("Debug: compute_edges"):
-            st.write({"rows_missing_valid_decimal_odds": missing_dec})
-
-    return df
-
-# --- Ensure american_odds is numeric and valid ---
-odds_df["american_odds"] = pd.to_numeric(odds_df["american_odds"], errors="coerce")
-bad_ao = odds_df["american_odds"].isna() | (odds_df["american_odds"] == 0)
-if bad_ao.any():
-    st.warning(f"Removed {int(bad_ao.sum())} row(s) with invalid american_odds (NaN or 0).")
-    odds_df = odds_df[~bad_ao]
-
-# --- Derive decimal_odds vectorized (ignore any previous mapping that returned None) ---
-ao = odds_df["american_odds"].astype(float)
-dec = np.where(ao > 0, 1.0 + ao/100.0, 1.0 + 100.0/ao.abs())
-odds_df["decimal_odds"] = dec
-
-# --- Normalize labels BEFORE compute_edges ---
-odds_df["selection"]   = odds_df["selection"].astype(str).str.strip().str.upper()
-odds_df["market_type"] = odds_df["market_type"].astype(str).str.strip().str.upper()
-
-# --- Quick debug to confirm decimals look good ---
-with st.expander("Debug: american → decimal"):
-    st.write({
-        "rows_now": len(odds_df),
-        "decimal_odds_null": int(odds_df["decimal_odds"].isna().sum()),
-        "decimal_odds_le_1": int((odds_df["decimal_odds"] <= 1).sum()),
-    })
-    st.write(odds_df[["american_odds", "decimal_odds"]].head(10))
-
-edges_df = compute_edges(odds_df)
-
-with st.expander("Debug: model & EV sample"):
-    st.write(edges_df[["selection","decimal_odds","model_prob","ev_per_$","kelly_25"]].head(10))
-    st.write("model_prob describe:", edges_df["model_prob"].describe())
-    st.write("decimal_odds describe:", edges_df["decimal_odds"].describe())
-
-# --- Best price per selection across books (robust to NaNs) ---
-# Normalize selection just in case
-edges_df["selection"] = edges_df["selection"].astype(str).str.upper().str.strip()
-
-# Keep only known 2-way selections for arb logic; others still work for EV
-known = {"HOME","AWAY","OVER","UNDER"}
-unknown_mask = ~edges_df["selection"].isin(known)
-if unknown_mask.any():
-    st.info(f"Ignoring {int(unknown_mask.sum())} row(s) for arbitrage pairing due to unknown selection label(s). They still appear in the Edges table.")
-
-
-best_prices = (
-    edges_df
-    .dropna(subset=["decimal_odds"])                         # drop rows where price is missing
-    .sort_values(["event_id","market_type","selection","decimal_odds"], ascending=[True, True, True, False])
-    .drop_duplicates(subset=["event_id","market_type","selection"], keep="first")
-    .reset_index(drop=True)
-)
-
-
-# --- Tabs ---
-T1, T2, T3, T4 = st.tabs(["Today/Edges", "Arbitrage", "Bets & Bankroll", "Raw Odds"])
-
-
-with T1:
-    section("Edges by Market (¼-Kelly suggestions)")
-
- # ---- Stable widget state (inside with T1:) ----
-    st.session_state.setdefault("ui_only_pos_ev", True)
-    st.session_state.setdefault("ui_min_edge", 0.0)
-
-    st.session_state["ui_min_edge"] = st.slider(
-        "Min edge (% per $1)",
-        -10.0, 20.0,
-        float(st.session_state["ui_min_edge"]),
-        0.5,
-        key="min_edge_sld",
-    )
-    st.session_state["ui_only_pos_ev"] = st.checkbox(
-        "Only positive EV",
-        value=bool(st.session_state["ui_only_pos_ev"]),
-        key="only_pos_ev_chk",
-    )
-
-
-    # Apply filters using the stable state
-    view = edges_df.copy()
-    if st.session_state["ui_only_pos_ev"]:
-        view = view[view["ev_per_$"] > 0]
-    view = view[view["edge_%"] >= float(st.session_state["ui_min_edge"])]
-
-    # ---- (#4) Empty-table explanation (debug) ----
-    if view.empty:
-        with st.expander("Why is this empty? (debug)"):
-            st.write({
-                "rows_loaded": len(edges_df),
-                "positive_ev_rows": int((edges_df["ev_per_$"] > 0).sum()),
-                "min_edge_filter": float(st.session_state["ui_min_edge"]),
-                "only_pos_ev": bool(st.session_state["ui_only_pos_ev"]),
-            })
-            st.write("Model prob summary:", edges_df["model_prob"].describe())
-            st.write("EV per $ summary:", edges_df["ev_per_$"].describe())
-
-
-
-    cols = [
-    "event_id","league","start_time","market_type","selection","book",
-    "american_odds","decimal_odds","model_prob","ev_per_$","kelly_25"
-    ]
-    st.dataframe(view[cols].sort_values(["start_time","event_id","market_type","selection"]).reset_index(drop=True), use_container_width=True)
-
-
-    st.divider()
-    section("Place a Bet (log to DB)")
-    with st.form("place_bet"):
-        pick = st.selectbox("Pick (from filtered table above)", options=[
-            f"{r.event_id} | {r.market_type} | {r.selection} | {r.book} | {int(r.american_odds)}"
-            for _, r in view.iterrows()
-        ]) if len(view) else None
-        stake = st.number_input("Stake ($)", min_value=1.0, value=25.0, step=1.0)
-        submitted = st.form_submit_button("Log bet")
-
-
-    if submitted and pick:
-        parts = [p.strip() for p in pick.split("|")]
-        event_id, market_type, selection, book, am_str = parts
-        row = view[(view["event_id"]==event_id) & (view["market_type"]==market_type) & (view["selection"]==selection) & (view["book"]==book) & (view["american_odds"]==int(am_str))].iloc[0]
-        bet_id = db.log_bet(
-            ts=datetime.utcnow().isoformat(),
-            event_id=row.event_id,
-            league=row.league,
-            selection=row.selection,
-            book=row.book,
-            american_odds=int(row.american_odds),
-            decimal_odds=float(row.decimal_odds),
-            stake=float(stake),
-        )
-        success(f"Bet logged with id={bet_id}")
-
-
-with T2:
-    section("Two-way Arbitrage Scanner (best prices across books)")
-    total_stake = st.number_input("Total stake for arb calc ($)", min_value=10.0, value=100.0, step=5.0)
+from app.core.live_eval import add_fair_probs
+# near the top of the file
+import os
+import contextlib
+
+def _get_odds_api_key() -> str | None:
+    # 1) env var takes precedence (works locally and on most hosts)
+    key = os.getenv("ODDS_API_KEY")
+    if key:
+        return key
     
-    # Build pairs per event/market: HOME vs AWAY (or OVER vs UNDER)
-    pairs = []
-    for (eid, mkt), g in best_prices.groupby(["event_id","market_type"], dropna=False):
-        if set(g["selection"]) >= {"HOME","AWAY"}:
-            home = g[g["selection"]=="HOME"].iloc[0]
-            away = g[g["selection"]=="AWAY"].iloc[0]
-            pairs.append((eid, mkt, home, away))
-        elif set(g["selection"]) >= {"OVER","UNDER"}:
-            over = g[g["selection"]=="OVER"].iloc[0]
-            under = g[g["selection"]=="UNDER"].iloc[0]
-            pairs.append((eid, mkt, over, under))
+    # 2) streamlit secrets (works on Streamlit Cloud or if you add .streamlit/secrets.toml)
+    with contextlib.suppress(Exception):
+        # Access inside try/suppress so missing secrets.toml won't crash
+        return st.secrets["ODDS_API_KEY"]  # type: ignore[attr-defined]
+    return None
 
+
+# Try to use your core arbitrage module; fall back to internal scan if not available.
+try:
+    from app.core.arb import is_two_way_arb, arb_stakes
+    HAS_CORE_ARB = True
+except Exception:
+    HAS_CORE_ARB = False
+
+@st.cache_data(show_spinner=False)
+def fetch_player_event_odds(
+    sport: str,
+    region: str,
+    markets: tuple[str, ...],
+    bookmakers: tuple[str, ...] | None = None,
+    max_events: int = 20,   # to control usage
+    odds_format: str = "american",
+) -> pd.DataFrame:
+    """
+    Player props must use the per-event odds endpoint.
+    1) Get upcoming events
+    2) For each event_id, call /events/{eventId}/odds with player_* markets
+    """
+    api_key = _get_odds_api_key()
+    if not api_key:
+        st.error("Missing ODDS_API_KEY.")
+        st.stop()
+
+    base = "https://api.the-odds-api.com/v4"
+    # 1) list events
+    evs_url = f"{base}/sports/{sport}/events"
+    evs_params = {"apiKey": api_key, "regions": region}
+    evs_resp = requests.get(evs_url, params=evs_params, timeout=30)
+    evs_resp.raise_for_status()
+    events = evs_resp.json()
+    if not events:
+        return pd.DataFrame()
 
     rows = []
-    for eid, mkt, a, b in pairs:
-        arb, margin = is_two_way_arb(float(a.decimal_odds), float(b.decimal_odds))
-        if arb:
-            s1, s2, ret, profit = arb_stakes(float(a.decimal_odds), float(b.decimal_odds), float(total_stake))
-            rows.append({
-                "event_id": eid,
-                "market_type": mkt,
-                "sel1": a.selection,
-                "book1": a.book,
-                "dec1": a.decimal_odds,
-                "sel2": b.selection,
-                "book2": b.book,
-                "dec2": b.decimal_odds,
-                "edge_margin": margin,
-                "stake1": round(s1,2),
-                "stake2": round(s2,2),
-                "guaranteed_return": round(ret,2),
-                "profit": round(profit,2),
+    markets_param = ",".join(markets)
+    bookies_param = ",".join(bookmakers) if bookmakers else None
+
+    # 2) per-event odds for player markets
+    for ev in events[:max_events]:
+        event_id = ev.get("id")
+        if not event_id:
+            continue
+        url = f"{base}/sports/{sport}/events/{event_id}/odds"
+        params = {
+            "apiKey": api_key,
+            "regions": region,
+            "oddsFormat": odds_format,
+            "markets": markets_param,
+        }
+        if bookies_param:
+            params["bookmakers"] = bookies_param
+
+        r = requests.get(url, params=params, timeout=30)
+        # Some events won't have props; skip cleanly
+        if r.status_code == 404:
+            continue
+        r.raise_for_status()
+        data = r.json()
+
+        # Normalize: flatten bookmakers -> markets -> outcomes
+        event_name = f"{ev.get('home_team','')} vs {ev.get('away_team','')}".strip()
+        commence = ev.get("commence_time")
+
+        for bk in data.get("bookmakers", []):
+            book = bk.get("key") or bk.get("title")
+            for mk in bk.get("markets", []):
+                mkey = mk.get("key")
+                point = mk.get("point")  # some props put line here; outcomes also carry point
+                for oc in mk.get("outcomes", []):
+                    # The Odds API usually puts Over/Under name in 'name' and player name in 'description' or 'participant'
+                    outcome = oc.get("name")
+                    player = oc.get("description") or oc.get("participant") or oc.get("player")
+                    price_american = oc.get("price") or oc.get("american") or oc.get("price_american")
+                    price_decimal = oc.get("price_decimal")
+
+                    # derive decimal if needed
+                    if price_decimal is None and price_american is not None:
+                        try:
+                            price_decimal = american_to_decimal(float(price_american))
+                        except Exception:
+                            price_decimal = None
+
+                    # prefer outcome-level point if present
+                    line = oc.get("point", point)
+
+                    rows.append({
+                        "event_id": event_id,
+                        "event": event_name,
+                        "commence_time": commence,
+                        "player": player,
+                        "market": mkey,
+                        "point": line,
+                        "outcome": outcome,
+                        "bookmaker": book,
+                        "price_american": price_american,
+                        "price_decimal": price_decimal,
+                        "decimal_odds": price_decimal,  # convenience alias
+                    })
+
+    return pd.DataFrame(rows)
+
+
+def _scan_two_way_arbs_from_core(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build a simple 2-way arb table using your pairwise core helpers.
+    Expects df with columns: event_id, market, outcome, bookmaker, price_american (and/or price_decimal).
+    """
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["event_id","market","arb_implied_sum","arb_exists"])
+
+    # Keep only 2-outcome markets
+    g = df.groupby(["event_id","market"])["outcome"].nunique().reset_index(name="n_outcomes")
+    keep = g[g["n_outcomes"] == 2][["event_id","market"]]
+    df2 = df.merge(keep, on=["event_id","market"], how="inner")
+
+    # Best price per outcome across books (by highest decimal odds)
+    def _american_to_decimal(a):
+        a = float(a)
+        return 1.0 + (a / 100.0) if a > 0 else 1.0 + (100.0 / abs(a))
+
+    tmp = df2.copy()
+    if "price_decimal" not in tmp.columns:
+        tmp["price_decimal"] = tmp["price_american"].astype(float).map(_american_to_decimal)
+
+    # For each event/market/outcome choose max decimal odds and remember which book had it
+    idx = tmp.groupby(["event_id","market","outcome"])["price_decimal"].idxmax()
+    best = tmp.loc[idx, ["event_id","market","outcome","bookmaker","price_decimal","price_american"]]
+
+    # Pivot to two columns (one per outcome)
+    piv = best.pivot_table(index=["event_id","market"],
+                           columns="outcome",
+                           values=["price_decimal","price_american","bookmaker"],
+                           aggfunc="first")
+
+    if piv.empty or len(piv.columns.get_level_values(1).unique()) != 2:
+        return pd.DataFrame(columns=["event_id","market","arb_implied_sum","arb_exists"])
+
+    outcomes = list(piv.columns.get_level_values(1).unique())
+    o1, o2 = outcomes[0], outcomes[1]
+
+    # Flatten columns
+    piv.columns = [f"{lvl0}_{lvl1}" for (lvl0,lvl1) in piv.columns]
+    piv = piv.reset_index()
+
+    # Use your core pairwise tester
+    ok_list, margin_list, invsum_list = [], [], []
+    for _, r in piv.iterrows():
+        d1 = float(r[f"price_decimal_{o1}"])
+        d2 = float(r[f"price_decimal_{o2}"])
+        ok, margin = is_two_way_arb(d1, d2)
+        ok_list.append(ok)
+        margin_list.append(margin)
+        invsum_list.append(1.0/d1 + 1.0/d2)
+
+    piv["arb_exists"] = ok_list
+    piv["arb_margin"] = margin_list
+    piv["arb_implied_sum"] = invsum_list
+
+    # Rename columns to readable names
+    out = piv.rename(columns={
+        f"bookmaker_{o1}": f"best_book_{o1}",
+        f"bookmaker_{o2}": f"best_book_{o2}",
+        f"price_american_{o1}": f"best_american_{o1}",
+        f"price_american_{o2}": f"best_american_{o2}",
+        f"price_decimal_{o1}": f"best_decimal_{o1}",
+        f"price_decimal_{o2}": f"best_decimal_{o2}",
+    })
+    # Sort by best opportunities first
+    return out.sort_values(["arb_exists","arb_implied_sum"]).reset_index(drop=True)
+
+def _add_stakes_from_core(arbs: pd.DataFrame, total_stake: float = 100.0) -> pd.DataFrame:
+    """Add stake splits & guaranteed profit using your core arb_stakes()."""
+    if arbs.empty:
+        return arbs
+    arbs = arbs.copy()
+    # Find which two outcome columns we have
+    dec_cols = [c for c in arbs.columns if c.startswith("best_decimal_")]
+    if len(dec_cols) < 2:
+        return arbs
+    d1_col, d2_col = dec_cols[:2]
+    name1 = d1_col.replace("best_decimal_", "")
+    name2 = d2_col.replace("best_decimal_", "")
+
+    s1_list, s2_list, ret_list, prof_list = [], [], [], []
+    for _, r in arbs.iterrows():
+        d1 = float(r[d1_col]); d2 = float(r[d2_col])
+        s1, s2, guaranteed_return, profit = arb_stakes(d1, d2, total_stake)
+        s1_list.append(round(s1, 2)); s2_list.append(round(s2, 2))
+        ret_list.append(round(guaranteed_return, 2)); prof_list.append(round(profit, 2))
+
+    arbs[f"stake_{name1}"] = s1_list
+    arbs[f"stake_{name2}"] = s2_list
+    arbs["guaranteed_return_$"] = ret_list
+    arbs["guaranteed_profit_$"] = prof_list
+    return arbs
+
+
+load_dotenv()
+
+st.set_page_config(page_title="Live Edges & Kelly", page_icon="💹", layout="wide")
+st.title("Live Odds → Edges & Kelly")
+st.caption("Real-time odds → vig-free probabilities → baseline model → EV & Kelly. Optional arbitrage across books.")
+
+# =========================
+# Odds fetch (live, cached) — direct JSON from The Odds API
+# =========================
+API_BASE = "https://api.the-odds-api.com/v4"
+
+@st.cache_data(show_spinner=False, ttl=30)
+def fetch_live_odds(sport: str, region: str, markets: tuple[str, ...], bookmakers: tuple[str, ...]) -> pd.DataFrame:
+    """
+    Calls The Odds API directly and returns a normalized DataFrame:
+      event_id, event, commence_time_utc, market, outcome, bookmaker, price_american [, point, price_decimal]
+    """
+    api_key = _get_odds_api_key()
+    if not api_key:
+        st.error(
+        "No API key found. Set ODDS_API_KEY as an environment variable "
+        "or add it to `.streamlit/secrets.toml` as ODDS_API_KEY = \"...\""
+        )
+        st.stop()
+
+
+    params = {
+        "apiKey": api_key,
+        "regions": region,                              # e.g., 'us'
+        "markets": ",".join(markets) or "h2h",         # e.g., 'h2h,spreads,totals'
+        "oddsFormat": "american",
+    }
+    if bookmakers:
+        params["bookmakers"] = ",".join(bookmakers)    # optional filter
+
+    url = f"{API_BASE}/sports/{sport}/odds"
+    resp = requests.get(url, params=params, timeout=20)
+    resp.raise_for_status()
+    payload = resp.json()
+
+    # Optional: expose rate limit info in the UI
+    rl_used = resp.headers.get("x-requests-used")
+    rl_remaining = resp.headers.get("x-requests-remaining")
+    if rl_used and rl_remaining:
+        st.caption(f"Requests used: {rl_used} • Remaining: {rl_remaining}")
+
+    return _normalize_theoddsapi_payload(
+        payload,
+        want_markets=set(markets),
+        want_books=set(bookmakers) if bookmakers else None,
+    )
+
+def _normalize_theoddsapi_payload(payload, want_markets: set[str], want_books: set[str] | None) -> pd.DataFrame:
+    """
+    Convert The Odds API JSON into a flat DataFrame:
+      event_id, event, commence_time_utc, market, outcome, bookmaker, price_american [, point, price_decimal]
+    """
+    if payload is None:
+        return pd.DataFrame()
+
+    rows = []
+    events = payload if isinstance(payload, list) else payload.get("data") or payload.get("events") or []
+    for ev in events:
+        event_id = ev.get("id") or ev.get("event_id") or ev.get("key")
+        start_raw = ev.get("commence_time") or ev.get("commence_time_utc") or ev.get("start_time")
+        try:
+            commence_time_utc = pd.to_datetime(start_raw, utc=True).isoformat() if start_raw else None
+        except Exception:
+            commence_time_utc = start_raw
+
+        home = ev.get("home_team") or ev.get("home")
+        away = ev.get("away_team") or ev.get("away")
+        event_name = ev.get("event") or (f"{home} vs {away}" if home and away else str(event_id))
+
+        for bk in ev.get("bookmakers", []):
+            book_key = (bk.get("key") or bk.get("title") or bk.get("bookmaker") or "").lower()
+            if want_books and book_key not in want_books:
+                continue
+
+            for m in bk.get("markets", []):
+                market = (m.get("key") or m.get("market") or "").lower()
+                if want_markets and market not in want_markets:
+                    continue
+
+                for o in m.get("outcomes", []):
+                    outcome = (o.get("name") or o.get("outcome") or "").lower()
+                    price_am = o.get("price") or o.get("odds") or o.get("american")
+                    price_dec = o.get("price_decimal") or o.get("decimal")
+                    point = o.get("point")
+
+                    # If only decimal provided, derive American
+                    if price_am is None and price_dec is not None:
+                        try:
+                            d = float(price_dec)
+                            price_am = int(round((d - 1.0) * 100)) if d >= 2.0 else int(round(-100 / (d - 1.0)))
+                        except Exception:
+                            pass
+
+                    rows.append({
+                        "event_id": event_id,
+                        "event": event_name,
+                        "commence_time_utc": commence_time_utc,
+                        "market": market,
+                        "outcome": outcome,
+                        "bookmaker": book_key,
+                        "price_american": pd.to_numeric(price_am, errors="coerce"),
+                        "point": pd.to_numeric(point, errors="coerce"),
+                    })
+
+    df = pd.DataFrame.from_records(rows)
+    if df.empty:
+        return df
+
+    # Normalize text columns
+    df["market"] = df["market"].astype(str).str.lower()
+    df["outcome"] = df["outcome"].astype(str).str.lower()
+
+    # Derive decimal odds when American present
+    def _american_to_decimal(a):
+        try:
+            a = float(a)
+            return 1.0 + (a / 100.0) if a > 0 else 1.0 + (100.0 / abs(a))
+        except Exception:
+            return np.nan
+
+    df["price_decimal"] = df["price_american"].map(_american_to_decimal)
+
+    sort_cols = [c for c in ["commence_time_utc", "event", "bookmaker", "market", "outcome"] if c in df.columns]
+    return df.sort_values(sort_cols).reset_index(drop=True)
+
+# EV/Kelly helpers vectorized
+
+def ev_per_unit(decimal_odds, model_prob):
+    """
+    Works with scalars OR pandas Series/arrays.
+    Returns expected profit per $1 stake.
+    """
+    d = pd.to_numeric(decimal_odds, errors="coerce")
+    p = pd.to_numeric(model_prob, errors="coerce")
+    b = d - 1.0
+    q = 1.0 - p
+    return p * b - q
+
+def kelly_fraction(decimal_odds, model_prob):
+    """
+    Works with scalars OR pandas Series/arrays.
+    Kelly = (b*p - q) / b, clipped at >= 0 and b>0.
+    """
+    d = pd.to_numeric(decimal_odds, errors="coerce")
+    p = pd.to_numeric(model_prob, errors="coerce")
+    b = d - 1.0
+    q = 1.0 - p
+
+    # avoid divide-by-zero and negative b
+    k = np.where(b > 0, (b * p - q) / b, 0.0)
+    # no negative Kelly
+    return np.clip(k, 0.0, None)
+
+
+# =========================
+# Fallback 2-way arb scan
+# =========================
+def _scan_two_way_arbs(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Simple internal two-way arb scan across books. Looks only at markets with exactly two outcomes
+    (e.g., h2h without draw, spreads, totals). Returns best odds and whether implied sums < 1.
+    """
+    core = df.copy()
+    core = core[core["market"].isin(["h2h", "spreads", "totals"])]
+    core = core[~core["outcome"].eq("draw")]
+    core["imp"] = core["price_american"].map(american_to_implied_prob)
+
+    # groups with exactly two distinct outcomes
+    n_outcomes = core.groupby(["event_id", "market"])["outcome"].nunique()
+    valid = n_outcomes[n_outcomes == 2].index
+    if len(valid) == 0:
+        return pd.DataFrame(columns=["event_id","market","arb_implied_sum","arb_exists"])
+
+    core = core.set_index(["event_id","market"]).loc[valid].reset_index()
+
+    # best (lowest implied; i.e., highest price) per outcome
+    idx_best = core.groupby(["event_id","market","outcome"])["imp"].idxmin()
+    best = core.loc[idx_best].copy()
+
+    piv_imp = best.pivot(index=["event_id","market"], columns="outcome", values="imp")
+    if piv_imp.shape[1] != 2:
+        return pd.DataFrame(columns=["event_id","market","arb_implied_sum","arb_exists"])
+
+    outcomes = list(piv_imp.columns)
+    piv_imp["arb_implied_sum"] = piv_imp[outcomes[0]] + piv_imp[outcomes[1]]
+    piv_imp["arb_exists"] = piv_imp["arb_implied_sum"] < 1.0
+
+    piv_book = best.pivot(index=["event_id","market"], columns="outcome", values="bookmaker")
+    piv_price = best.pivot(index=["event_id","market"], columns="outcome", values="price_american")
+
+    out = piv_imp.reset_index()
+    for c in outcomes:
+        out[f"best_book_{c}"]       = piv_book[c].values
+        out[f"best_american_{c}"]   = piv_price[c].values
+    return out.sort_values(["arb_exists","arb_implied_sum"]).reset_index(drop=True)
+
+
+# =========================
+# Sidebar (you’ve got 9 US books; feel free to expand defaults)
+# =========================
+st.sidebar.header("Live data")
+sport = st.sidebar.selectbox(
+    "Sport",
+    ["basketball_nba", "icehockey_nhl", "americanfootball_nfl", "baseball_mlb", "soccer_epl"],
+    index=0,
+)
+region = st.sidebar.selectbox("Region", ["us", "uk", "eu", "au"], index=0)
+markets = st.sidebar.multiselect("Markets", ["h2h", "spreads", "totals"], default=["h2h", "spreads", "totals"])
+bookmakers = st.sidebar.multiselect(
+    "Bookmakers (optional)",
+    # Add/adjust to match your provider’s book keys (you said ~9 for US)
+    ["pinnacle","draftkings","fanduel","betmgm","caesars","williamhill_us","pointsbetus","betrivers","wynnbet"],
+    default=[]
+)
+
+st.sidebar.header("Model")
+m = st.slider(
+    "Model multiplier (confidence)",
+    min_value=0.85, max_value=1.30, value=1.00, step=0.01,
+    help="Scales your model’s win probability: p' = clip(m * p, 0–1). Start at 1.00 and adjust slowly."
+)
+
+# Default prior strength (controls how heavily the baseline trusts prior_center)
+prior_strength = 0.5     # try 0.25–1.0 range; smaller = more reactive, larger = more conservative
+prior_center = 0.50
+min_p, max_p = 0.01, 0.99
+
+cfg = BaselineConfig(
+    prior_strength=prior_strength,
+    prior_center=prior_center,
+    min_p=min_p,
+    max_p=max_p
+)
+baseline = BaselineModel(cfg)
+
+
+show_arb = st.sidebar.toggle("Enable Arbitrage tab", value=True)
+
+# =========================
+# Tabs
+# =========================
+tabs = ["Live odds", "Edges & Kelly","Players"]
+if show_arb:
+    tabs.append("Arbitrage")
+tab_objs = st.tabs(tabs)
+
+# ── Live odds ─────────────────────────────────────────────────────────────────
+with tab_objs[0]:
+    st.subheader("Live odds")
+    df_live = fetch_live_odds(sport, region, tuple(markets), tuple(bookmakers))
+    st.caption(f"{len(df_live)} selections loaded.")
+    if df_live.empty:
+        st.info("No odds returned for this selection.")
+    else:
+        st.dataframe(
+            df_live.sort_values(["commence_time_utc","bookmaker","market","outcome"]).reset_index(drop=True),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+
+# ── Edges & Kelly ────────────────────────────────────────────────────────────
+with tab_objs[1]:
+    st.subheader("Edges & Kelly")
+    df_live = fetch_live_odds(sport, region, tuple(markets), tuple(bookmakers))
+
+    if df_live.empty:
+        st.info("No odds returned for this selection.")
+    else:
+        # 1) Vig-free probabilities per book/event/market
+        df_fair = add_fair_probs(df_live)
+
+        # 2) Ensure we have decimal odds available
+        if "decimal_odds" not in df_fair.columns:
+            if "price_decimal" in df_fair.columns:
+                df_fair["decimal_odds"] = df_fair["price_decimal"].astype(float)
+            elif "american_odds" in df_fair.columns:
+                df_fair["decimal_odds"] = df_fair["american_odds"].astype(float).map(american_to_decimal)
+            elif "price_american" in df_fair.columns:
+                df_fair["decimal_odds"] = df_fair["price_american"].astype(float).map(american_to_decimal)
+            else:
+                st.error("No decimal odds found (need decimal_odds, price_decimal, american_odds, or price_american).")
+                st.stop()
+
+        # 3) Baseline model → RAW model probability (row-wise; uses p_fair when present)
+        def _predict_row(r) -> float:
+            return baseline.predict(
+                market_prob_vigfree = r.get("p_fair", None),  # may be None; baseline can choose a fallback
+                selection           = r.get("outcome", ""),
+                market_type         = r.get("market", ""),
+                point               = r.get("point", None),
+            )
+
+        df_fair["model_prob"] = df_fair.apply(_predict_row, axis=1).astype(float)
+
+        # 4) Apply the slider multiplier m and clamp to [min_p, max_p]
+        #    (m is the "Model multiplier (confidence)" slider you added earlier)
+        df_fair["model_prob_adj"] = np.clip(df_fair["model_prob"] * m, min_p, max_p)
+
+        # 5) EV & Kelly using the **adjusted** probability
+        def _eval_row(r):
+            be = evaluate(decimal_odds=float(r["decimal_odds"]), model_prob=float(r["model_prob_adj"]))
+            # evaluate() returns a BetEval dataclass in your ev.py (ev_per_dollar, kelly, kelly_quarter)
+            return pd.Series({
+                "ev_per_dollar": round(be.ev_per_dollar, 4),
+                "kelly": round(be.kelly, 4),
+                "kelly_quarter": round(be.kelly_quarter, 4),
             })
 
+        df_eval = df_fair.apply(_eval_row, axis=1)
+        df_out = pd.concat([df_fair, df_eval], axis=1)
 
-    if rows:
-        st.dataframe(pd.DataFrame(rows).sort_values("profit", ascending=False), use_container_width=True)
-    else:
-        st.info("No two-way arbitrage found with current prices.")
-    
-with T3:
-    st.header("Bankroll & Bets")
+        # 6) Optional: show "edge" vs vig-free probability if available
+        if "p_fair" in df_out.columns:
+            df_out["edge_prob"] = (df_out["model_prob_adj"] - df_out["p_fair"]).round(4)
 
-    start, open_risk, realized = db.bankroll_snapshot()
-    current = start - open_risk + realized
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Starting", f"${start:,.2f}")
-    c2.metric("Open Risk", f"${open_risk:,.2f}")
-    c3.metric("Realized PnL", f"${realized:,.2f}")
-    c4.metric("Current", f"${current:,.2f}")
-
-    bets = db.list_bets()
-    if bets:
-        dfb = pd.DataFrame(
-            bets,
-            columns=["id","ts","event_id","league","selection","book","american_odds","decimal_odds","stake","result","pnl"]
-        ).sort_values("ts", ascending=False)
-        st.dataframe(dfb, use_container_width=True)
-
-        st.subheader("Settle Bet")
-        sel_id = st.selectbox("Bet ID", options=dfb["id"].tolist())
-        res = st.selectbox("Result", options=["WIN","LOSE","PUSH"])
-        if st.button("Settle"):
-            db.settle_bet(int(sel_id), res)
-            st.success("Bet settled.")
-            st.rerun()
-
-        st.download_button(
-            label="Download bets CSV",
-            data=dfb.to_csv(index=False).encode("utf-8"),
-            file_name="bets_export.csv",
-            mime="text/csv",
+        # 7) Display — sort by EV per $ descending
+        cols_show = [
+            "event", "commence_time", "market", "outcome", "bookmaker",
+            "decimal_odds", "p_fair", "model_prob", "model_prob_adj",
+            "ev_per_dollar", "kelly", "kelly_quarter", "edge_prob"
+        ]
+        cols_show = [c for c in cols_show if c in df_out.columns]
+        st.dataframe(
+            df_out[cols_show].sort_values("ev_per_dollar", ascending=False),
+            use_container_width=True, hide_index=True
         )
+
+# ── Players (Edges & Kelly) ───────────────────────────────────────────────────
+with tab_objs[2]:
+    st.subheader("Player Props — Edges & Kelly")
+
+    # Controls (re-use your existing sidebar selects for sport/region/bookmakers if you like)
+    default_markets = ["player_points", "player_assists", "player_rebounds"]
+    ply_markets = st.multiselect("Player markets", default_markets, default=default_markets)
+    player_search = st.text_input("Filter by player name (optional)", value="")
+
+   
+    # Fetch player props by calling the same live-odds fetcher with player markets
+    df_players = fetch_player_event_odds(sport, region, tuple(ply_markets), tuple(bookmakers))
+
+
+    if df_players.empty:
+        st.info("No player props returned for this selection.")
     else:
-        st.info("No bets yet. Log one on the Edges tab.")
+        # Optional filter by player name
+        if player_search:
+            mask = df_players["player"].str.contains(player_search, case=False, na=False) if "player" in df_players.columns else True
+            df_players = df_players[mask].copy()
 
-    hist = db.history_rows()
-    if hist:
-        dh = pd.DataFrame(hist, columns=["ts","starting","open_risk","realized","current"])
-        dh["ts"] = pd.to_datetime(dh["ts"])
-        st.line_chart(dh.set_index("ts")["current"], height=220)
+        # Compute edges using the SAME slider 'm' and the SAME baseline you already created
+        from app.core.player_eval import compute_player_edges
+        df_out = compute_player_edges(df_players, baseline_model=baseline, m=m, min_p=min_p, max_p=max_p, markets=ply_markets)
+
+        if df_out.empty:
+            st.success("No opportunities found at the moment.")
+        else:
+            cols = [
+                "event", "commence_time", "player", "market", "point", "outcome",
+                "bookmaker", "decimal_odds", "p_fair", "model_prob", "model_prob_adj",
+                "ev_per_dollar", "kelly", "kelly_quarter", "edge_prob"
+            ]
+            cols = [c for c in cols if c in df_out.columns]
+            st.dataframe(df_out[cols], use_container_width=True, hide_index=True)
 
 
-with T4:
-    section("Raw odds (debug)")
-    st.dataframe(odds_df, use_container_width=True)
-    section("Computed edges (debug)")
-    st.dataframe(edges_df, use_container_width=True)
+# ── Arbitrage (optional) ─────────────────────────────────────────────────────
+if show_arb:
+    with tab_objs[2]:
+        st.subheader("Two-way arbitrage across books")
+        df_live = fetch_live_odds(sport, region, tuple(markets), tuple(bookmakers))
+        if df_live.empty:
+            st.info("No odds returned for this selection.")
+        else:
+            if HAS_CORE_ARB:
+                arbs = _scan_two_way_arbs_from_core(df_live)
+                if arbs.empty or not arbs.get("arb_exists", pd.Series([False])).any():
+                    st.success("No 2-way arbs found right now.")
+                else:
+                    arbs = _add_stakes_from_core(arbs, total_stake=100.0)
+                    st.warning("Potential arbs detected — verify limits and rules before placing bets.")
+                    st.dataframe(arbs, use_container_width=True, hide_index=True)
 
-
-    st.caption("Use this tab when something looks off — check inputs and derived columns.")
+            else:
+                # Fallback internal scan
+                arbs = _scan_two_way_arbs(df_live)
+                if arbs.empty or not arbs["arb_exists"].any():
+                    st.success("No 2-way arbs found right now.")
+                else:
+                    # Simple equalized stakes for a $100 notional using implied→decimal
+                    recs = []
+                    outcome_cols = [c for c in arbs.columns if c.startswith("best_american_")]
+                    if len(outcome_cols) >= 2:
+                        o1, o2 = outcome_cols[:2]
+                        name1, name2 = o1.replace("best_american_", ""), o2.replace("best_american_", "")
+                        for _, row in arbs.iterrows():
+                            p1 = american_to_implied_prob(row[o1])
+                            p2 = american_to_implied_prob(row[o2])
+                            if p1 + p2 >= 1.0:
+                                s1 = s2 = guaranteed = 0.0
+                            else:
+                                total = 100.0
+                                s1 = total * p2 / (p1 + p2)
+                                s2 = total * p1 / (p1 + p2)
+                                d1, d2 = 1.0 / p1, 1.0 / p2
+                                ret1 = s1 * (d1 - 1.0) - s2
+                                ret2 = s2 * (d2 - 1.0) - s1
+                                guaranteed = min(ret1, ret2)
+                            rec = dict(row)
+                            rec[f"stake_{name1}"] = round(s1, 2)
+                            rec[f"stake_{name2}"] = round(s2, 2)
+                            rec["guaranteed_profit_$"] = round(guaranteed, 2)
+                            recs.append(rec)
+                    arbs_stakes = pd.DataFrame.from_records(recs) if recs else arbs
+                    st.warning("Potential arbs detected — verify limits and rules before placing bets.")
+                    st.dataframe(arbs_stakes, use_container_width=True, hide_index=True)
