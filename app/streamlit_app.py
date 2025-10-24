@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-THE_ODDS_API_KEY = st.secrets["api_keys"]["the_odds_api"]
+ODDS_API_KEY = st.secrets["ODDS_API_KEY"]
 
 from dotenv import load_dotenv
 import os
